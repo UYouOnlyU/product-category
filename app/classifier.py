@@ -5,11 +5,23 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple
+import os
+import warnings
 
 try:
     # vertexai is provided by google-cloud-aiplatform
     from vertexai import init as vertexai_init  # type: ignore
-    from vertexai.preview.generative_models import GenerativeModel, GenerationConfig  # type: ignore
+    try:
+        # Prefer stable import path if available
+        from vertexai.generative_models import GenerativeModel, GenerationConfig  # type: ignore
+    except Exception:  # fallback for older SDKs
+        from vertexai.preview.generative_models import GenerativeModel, GenerationConfig  # type: ignore
+    # Optionally silence known deprecation warning from the SDK to keep logs clean
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*deprecated.*genai-vertexai-sdk.*",
+        category=UserWarning,
+    )
 except Exception:  # pragma: no cover - import-time fallback for environments without lib
     vertexai_init = None
     GenerativeModel = None  # type: ignore
@@ -64,12 +76,47 @@ def _parse_score(v: object) -> float | None:
 
 class GeminiClassifier:
     def __init__(self, project: str, location: str, model_name: str, categories: List[str]):
-        if vertexai_init is None or GenerativeModel is None:
-            raise RuntimeError(
-                "google-cloud-aiplatform (vertexai) is not available. Install dependencies and retry."
-            )
-        vertexai_init(project=project, location=location)
-        self._model = GenerativeModel(model_name)
+        # Choose backend: vertexai (default) or googleai
+        backend = (os.getenv("GENAI_BACKEND") or "vertexai").strip().lower()
+        self._provider = None
+        self._ga_client = None
+        self._model = None
+        self._model_name = model_name
+
+        if backend == "googleai":
+            try:
+                from google import genai  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    "google-genai is not installed. Install it or set GENAI_BACKEND=vertexai"
+                ) from e
+            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "Missing GOOGLE_API_KEY/GENAI_API_KEY for google-ai backend"
+                )
+            self._ga_client = genai.Client(api_key=api_key)
+            self._provider = "googleai"
+        else:
+            if vertexai_init is None or GenerativeModel is None:
+                # If vertexai not available, try google-ai automatically
+                try:
+                    from google import genai  # type: ignore
+                    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY")
+                    if not api_key:
+                        raise RuntimeError(
+                            "Vertex AI SDK unavailable and GOOGLE_API_KEY not set for google-ai fallback"
+                        )
+                    self._ga_client = genai.Client(api_key=api_key)
+                    self._provider = "googleai"
+                except Exception as e:
+                    raise RuntimeError(
+                        "No supported Generative AI backend available. Install google-cloud-aiplatform or google-genai."
+                    ) from e
+            else:
+                vertexai_init(project=project, location=location)
+                self._model = GenerativeModel(model_name)
+                self._provider = "vertexai"
         self._categories = categories
         self._norm_map = normalize_categories(categories)
 
@@ -94,7 +141,9 @@ class GeminiClassifier:
             "- Meat terms (pork, bacon, beef, chicken, lamb, ham, sausage) map to 'Meat and Poultry', not produce or beverages.\n"
             "- Seafood terms (fish, shrimp, prawn, squid, crab, salmon, tuna) map to 'Seafood'.\n"
             "- Alcohol terms (beer, wine, whisky, spirits, liquor) map to alcohol categories, not non-alcoholic beverages.\n"
-            "- Terms implying food (kg, fresh, frozen, sliced, smoked, fillet) prefer food categories over equipment/services.\n\n"
+            "- Terms implying food (kg, g, ml, litre, pack, fresh, frozen, dried, sliced, smoked, fillet) prefer food categories over equipment/services.\n"
+            "- Items mentioning 'juice' or edible fruits (e.g., 'orange', 'tangerine') MUST map to an appropriate beverage/food category, never hardware or pharmaceuticals.\n"
+            "- Seaweed terms (seaweed, nori, kombu, wakame, kaiso, tosaka) map to 'Seafood' (or the closest edible sea vegetable category).\n\n"
             f"Allowed categories (ID: Name):\n{cats_lines}\n"
         )
 
@@ -154,6 +203,31 @@ class GeminiClassifier:
         final: List[Dict[str, object]] = [mapping[k] for k in norm_order]
         return final
 
+    def _gen_text(self, parts: List[str], want_json: bool = False) -> str:
+        try:
+            if self._provider == "vertexai":
+                if want_json:
+                    cfg = GenerationConfig(
+                        response_mime_type="application/json",
+                        temperature=0.0,
+                    )
+                    resp = self._model.generate_content(parts, generation_config=cfg)
+                else:
+                    resp = self._model.generate_content(parts)
+                return (getattr(resp, "text", "") or "").strip()
+            elif self._provider == "googleai":
+                cfg = {"temperature": 0.0}
+                if want_json:
+                    cfg["response_mime_type"] = "application/json"
+                # google-genai: pass list of strings as contents
+                resp = self._ga_client.models.generate_content(
+                    model=self._model_name, contents=parts, config=cfg
+                )
+                return (getattr(resp, "text", "") or "").strip()
+        except Exception:
+            return ""
+        return ""
+
     def _classify_chunk(self, descriptions: List[str]) -> List[Dict[str, object]]:
         if not descriptions:
             return []
@@ -168,14 +242,7 @@ class GeminiClassifier:
             "Respond with a JSON array of objects as specified."
         )
         try:
-            resp = self._model.generate_content(
-                [self._system_instruction, prompt],
-                generation_config=GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
-            text = (resp.text or "").strip()
+            text = self._gen_text([self._system_instruction, prompt], want_json=True)
             json_str = _extract_json_array(text)
             arr = json.loads(json_str)
             if isinstance(arr, list) and len(arr) == len(descriptions):
@@ -192,14 +259,7 @@ class GeminiClassifier:
                 "Return ONLY a JSON array of objects, one per item. Use category IDs only (e.g., C01). "
                 "Each object: {\"c1\": <ID>, \"s1\": <0..1>, \"c2\": <ID>, \"s2\": <0..1>}"
             )
-            resp = self._model.generate_content(
-                [self._system_instruction, strict, items],
-                generation_config=GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
-            text = (resp.text or "").strip()
+            text = self._gen_text([self._system_instruction, strict, items], want_json=True)
             json_str = _extract_json_array(text)
             arr = json.loads(json_str)
             if isinstance(arr, list) and len(arr) == len(descriptions):
@@ -224,31 +284,14 @@ class GeminiClassifier:
             "Return ONLY JSON object: {\"c1\": <ID>, \"s1\": <0..1>, \"c2\": <ID>, \"s2\": <0..1>}"
         )
         try:
-            resp = self._model.generate_content(
-                [self._system_instruction, prompt],
-                generation_config=GenerationConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
-            text = (resp.text or "").strip()
+            text = self._gen_text([self._system_instruction, prompt], want_json=True)
             obj = json.loads(_extract_json_object(text))
             return self._validate_top2(obj)
         except Exception:
             # No guessing: return nulls to indicate missing/invalid model output
             return None, None, None, None
 
-    def _classify_single_label(self, description: str) -> str:
-        prompt = (
-            f"Item description: {description}\n"
-            "Choose exactly one category from the allowed list. Return only the category text."
-        )
-        try:
-            resp = self._model.generate_content([self._system_instruction, prompt])
-            text = (resp.text or "").strip()
-        except Exception:
-            text = ""
-        return self._post_validate_label(text)
+    # Removed unused single-label method to reduce surface area
 
     def _validate_top2(self, obj: object) -> Tuple[str | None, float | None, str | None, float | None]:
         if not isinstance(obj, dict):

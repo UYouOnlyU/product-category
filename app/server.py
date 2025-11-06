@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
+from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from .config import load_config
 from .pipeline import run_pipeline
@@ -17,55 +18,107 @@ logging.basicConfig(
 )
 
 
-class RunRequest(BaseModel):
-    month: str
-    limit: int | None = None
-    dry_run: bool = False
-    progress_every: int | None = None
-    batch_size: int | None = None
-    concurrency: int | None = None
-    deduplicate: bool = True
+"""/run uses query parameters; no request body model needed."""
 
 
-app = FastAPI(title="Product Category Vibe API")
+app = FastAPI(title="Product Category API")
+
+# Configure CORS for frontend access
+_origins_env = os.getenv("FRONTEND_ORIGINS", "*")
+_origins = [o.strip() for o in _origins_env.split(",") if o.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
+    max_age=600,
+)
+
+# Optional API key for simple auth from frontend
+_api_key_required = os.getenv("API_KEY")
 
 
 @app.get("/healthz")
 def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
+# Additional simple health endpoints (some networks proxy-filter /healthz)
+@app.get("/")
+def root_health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+@app.get("/readyz")
+def readyz() -> Dict[str, str]:
+    return {"status": "ok"}
+
 
 @app.post("/run")
-def run(req: RunRequest) -> Dict[str, Any]:
+def run(
+    # Core parameters now accepted as query params
+    month: str = Query(..., description="Month to query, format YYYYMM (legacy MM-YYYY also accepted)"),
+    limit: int | None = Query(None, ge=1, description="Optional limit of rows"),
+    dry_run: bool = Query(False, alias="dry-run", description="Do not upload to GCS"),
+    # Optional performance knobs (also via query)
+    progress_every: int | None = Query(
+        None, ge=1, description="How often to log progress counts"
+    ),
+    batch_size: int | None = Query(
+        None, ge=1, description="Number of items per model call"
+    ),
+    concurrency: int | None = Query(
+        None, ge=1, description="Number of concurrent model calls"
+    ),
+    deduplicate: bool = Query(True, description="Deduplicate repeated descriptions"),
+    # Simple API key headers
+    x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> Dict[str, Any]:
+    # Simple API key check (via X-API-Key or Authorization: Bearer <key>) if configured
+    if _api_key_required:
+        provided = None
+        if x_api_key:
+            provided = x_api_key
+        elif authorization and authorization.lower().startswith("bearer "):
+            provided = authorization[7:].strip()
+        if provided != _api_key_required:
+            raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         cfg = load_config()
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     try:
-        batch_size = req.batch_size if req.batch_size is not None else (cfg.classify_batch_size or 8)
-        concurrency = req.concurrency if req.concurrency is not None else (cfg.classify_concurrency or 4)
-        progress_every = req.progress_every if req.progress_every is not None else (cfg.classify_progress_every or 1)
+        # Resolve performance knobs: Query > .env > defaults
+        eff_batch_size = batch_size if batch_size is not None else (cfg.classify_batch_size or 8)
+        eff_concurrency = concurrency if concurrency is not None else (cfg.classify_concurrency or 4)
+        eff_progress_every = (
+            progress_every if progress_every is not None else (cfg.classify_progress_every or 1)
+        )
 
         log.info(
             "API run | month=%s | limit=%s | dry_run=%s | batch_size=%s | concurrency=%s | progress_every=%s | dedupe=%s",
-            req.month,
-            req.limit,
-            req.dry_run,
-            batch_size,
-            concurrency,
-            progress_every,
-            req.deduplicate,
+            month,
+            limit,
+            dry_run,
+            eff_batch_size,
+            eff_concurrency,
+            eff_progress_every,
+            deduplicate,
         )
         result = run_pipeline(
             cfg,
-            month=req.month,
-            limit=req.limit,
-            dry_run=req.dry_run,
-            progress_every=max(1, progress_every),
-            batch_size=max(1, batch_size),
-            concurrency=max(1, concurrency),
-            deduplicate=req.deduplicate,
+            month=month,
+            limit=limit,
+            dry_run=dry_run,
+            progress_every=max(1, eff_progress_every),
+            batch_size=max(1, eff_batch_size),
+            concurrency=max(1, eff_concurrency),
+            deduplicate=deduplicate,
         )
         return result
     except ValueError as e:

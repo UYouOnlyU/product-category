@@ -11,23 +11,34 @@ def query_invoices_by_month(
     limit: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Query BigQuery rows for a given month (MM-YYYY) when `check_invoice_date` is stored as STRING.
-    Attempts to parse the string into DATE using common formats, then filters by month.
+    Query BigQuery rows for a given month using YYYYMM input while `check_invoice_date` is a STRING.
+
+    Supported `check_invoice_date` formats in the table (auto-parsed):
+    - YYYYMM (e.g., 202509 or "202509")
+    - MM-YYYY or MM/YYYY (legacy)
+    - YYYY-MM or YYYY/MM (fallback)
 
     Returns a list of dict rows containing at least: check_invoice_date, item_description, and all columns selected.
     """
-    # Simplified for STRING month-year values like 'MM-YYYY' (or 'MM/YYYY').
-    # We treat the value as the first day of that month and filter by the requested month bounds.
+    # Parse multiple known formats, preferring YYYYMM used by your table now.
+    # We treat dates as the first day of the month and filter by requested month bounds (MM-YYYY).
     query = f"""
     WITH src AS (
       SELECT
         *,
-        SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(check_invoice_date, '/', '-'), '-01')) AS parsed_month_start
+        COALESCE(
+          -- Primary: YYYYMM as string or int
+          SAFE.PARSE_DATE('%Y%m%d', CONCAT(CAST(check_invoice_date AS STRING), '01')),
+          -- Legacy: MM-YYYY or MM/YYYY
+          SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01')),
+          -- Fallback: YYYY-MM or YYYY/MM
+          SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01'))
+        ) AS parsed_month_start
       FROM `{table_id}`
     ), bounds AS (
       SELECT
-        SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(@month_str, '-01')) AS start_month,
-        DATE_ADD(SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(@month_str, '-01')), INTERVAL 1 MONTH) AS next_month
+        SAFE.PARSE_DATE('%Y%m%d', CONCAT(@month_str, '01')) AS start_month,
+        DATE_ADD(SAFE.PARSE_DATE('%Y%m%d', CONCAT(@month_str, '01')), INTERVAL 1 MONTH) AS next_month
     )
     SELECT s.* EXCEPT(parsed_month_start)
     FROM src s, bounds b

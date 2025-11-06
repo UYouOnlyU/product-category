@@ -4,6 +4,7 @@ import csv
 import json
 import re
 from datetime import datetime
+import os
 import logging
 from pathlib import Path
 from typing import List, Dict, Any
@@ -16,33 +17,27 @@ from .classifier import GeminiClassifier
 from .storage import upload_to_gcs
 
 
-MONTH_RE = re.compile(r"^(0[1-9]|1[0-2])-(19|20)\d\d$")
-
-# Heuristic post-correction for obvious food/meat/seafood disambiguation
-MEAT_KEYWORDS = {
-    "pork", "bacon", "beef", "chicken", "lamb", "ham", "sausage", "duck", "turkey", "meat",
-}
-SEAFOOD_KEYWORDS = {
-    "fish", "shrimp", "prawn", "squid", "octopus", "crab", "lobster", "salmon", "tuna", "mackerel",
-}
-FOOD_PRODUCE = {"Fruit and Vegetables"}
-MEAT_CATEGORY = "Meat and Poultry"
-SEAFOOD_CATEGORY = "Seafood"
+# Accept YYYYMM as primary; allow legacy MM-YYYY for backward compatibility
+RE_YYYYMM = re.compile(r"^(19|20)\d\d(0[1-9]|1[0-2])$")
+RE_MMYYYY = re.compile(r"^(0[1-9]|1[0-2])-(19|20)\d\d$")
 
 
-def _is_like(text: str, keys: set[str]) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in keys)
+def _to_yyyymm(month: str) -> str:
+    """Normalize supported month formats to YYYYMM.
 
+    Supports:
+    - YYYYMM (returns as-is)
+    - MM-YYYY (legacy; converts to YYYYMM)
+    """
+    m = month.strip()
+    if RE_YYYYMM.match(m):
+        return m
+    if RE_MMYYYY.match(m):
+        mm, yyyy = m.split("-")
+        return f"{yyyy}{mm}"
+    raise ValueError("month must be YYYYMM (or legacy MM-YYYY)")
 
-def adjust_food_prediction(desc: str, c1: str, s1: float, c2: str, s2: float) -> tuple[str, float, str, float]:
-    # Meat rule: if meat-like but predicted produce, switch to meat
-    if _is_like(desc, MEAT_KEYWORDS) and c1 in FOOD_PRODUCE:
-        return MEAT_CATEGORY, max(s1, 0.9), c1, min(s2, 0.1)
-    # Seafood rule: if seafood-like but predicted produce, switch to seafood
-    if _is_like(desc, SEAFOOD_KEYWORDS) and c1 in FOOD_PRODUCE:
-        return SEAFOOD_CATEGORY, max(s1, 0.9), c1, min(s2, 0.1)
-    return c1, s1, c2, s2
+# Removed unused heuristic post-corrections to keep model-only outputs
 
 
 def run_pipeline(
@@ -57,8 +52,8 @@ def run_pipeline(
 ) -> Dict[str, Any]:
     log = logging.getLogger("pipeline")
     log.info(f"Starting pipeline | month={month} | limit={limit} | dry_run={dry_run}")
-    if not MONTH_RE.match(month):
-        raise ValueError("month must be MM-YYYY")
+    # Validate and normalize month to YYYYMM for querying
+    month_yyyymm = _to_yyyymm(month)
 
     # Load allowed categories
     with open(cfg.categories_path, "r", encoding="utf-8") as f:
@@ -71,8 +66,8 @@ def run_pipeline(
 
     # BigQuery client
     bq_client = bigquery.Client(project=cfg.gcp_project_id)
-    log.info(f"Querying BigQuery | table={cfg.table_id} | month={month} | limit={limit}")
-    rows = query_invoices_by_month(bq_client, cfg.table_id, month, limit)
+    log.info(f"Querying BigQuery | table={cfg.table_id} | month={month_yyyymm} | limit={limit}")
+    rows = query_invoices_by_month(bq_client, cfg.table_id, month_yyyymm, limit)
     log.info(f"BigQuery returned rows | rows={len(rows)}")
 
     # Prepare descriptions for classification
@@ -133,7 +128,7 @@ def run_pipeline(
     # Write CSV locally
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     file_name = f"product-category_{month}_{ts}.csv"
-    out_dir = Path("output")
+    out_dir = Path(os.getenv("OUTPUT_DIR", "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
     local_path = out_dir / file_name
 
@@ -176,7 +171,8 @@ def run_pipeline(
     # Upload to GCS unless dry_run
     gcs_uri = None
     if not dry_run:
-        blob_path = f"{cfg.gcs_output_prefix.rstrip('/')}/{month}/{file_name}"
+        # Upload directly under the configured prefix without month subfolder
+        blob_path = f"{cfg.gcs_output_prefix.rstrip('/')}/{file_name}"
         log.info(f"Uploading to GCS | bucket={cfg.gcs_bucket} | blob={blob_path}")
         gcs_uri = upload_to_gcs(cfg.gcs_bucket, blob_path, str(local_path))
         log.info(f"Uploaded to GCS | gcs_uri={gcs_uri}")

@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Export categorized product data: BigQuery -> Gemini -> CSV -> GCS",
     )
-    parser.add_argument("--month", required=True, help="Month to query, format MM-YYYY")
+    parser.add_argument("--month", required=True, help="Month to query, format YYYYMM (legacy MM-YYYY also accepted)")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit of rows")
     parser.add_argument("--dry-run", action="store_true", help="Do not upload to GCS")
     parser.add_argument(

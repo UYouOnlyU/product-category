@@ -78,7 +78,10 @@ gcloud run deploy product-category-api \
     GCS_BUCKET=<BUCKET>,\
     GCS_OUTPUT_PREFIX=MBTH/product-category,\
     CLASSIFY_BATCH_SIZE=8,\
-    CLASSIFY_CONCURRENCY=4
+    CLASSIFY_CONCURRENCY=4,\
+    FRONTEND_ORIGINS=https://your-frontend.example.com,\
+    API_KEY=<strong_random_value>,\
+    GENAI_BACKEND=vertexai
 
 # For public testing only (remove for authenticated-only):
 #   --allow-unauthenticated
@@ -99,7 +102,7 @@ curl -X POST "$SERVICE_URL/run" \
   -H "Authorization: Bearer $ID_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "month": "09-2025",
+    "month": "202509",
     "limit": 100,
     "dry_run": false,
     "batch_size": 8,
@@ -107,8 +110,14 @@ curl -X POST "$SERVICE_URL/run" \
   }'
 ```
 
+Frontend integration
+- CORS: configure allowed origins via `FRONTEND_ORIGINS` (comma-separated). Use `*` for testing only.
+- Simple API key: set `API_KEY` and send it from the browser with header `X-API-Key: <value>` or `Authorization: Bearer <value>`.
+- For stronger auth, keep the service private (no `--allow-unauthenticated`) and front it with API Gateway or Identity-Aware Proxy.
+
 Operational tips
 - Adjust `CLASSIFY_BATCH_SIZE` and `CLASSIFY_CONCURRENCY` based on Vertex AI quotas and latency.
+- Backend selection: Set `GENAI_BACKEND=vertexai` (default) to use Vertex AI with GCP identity. To use Google AI with API key, set `GENAI_BACKEND=googleai` and `GOOGLE_API_KEY=<key>` and ensure `google-genai` is installed in the image.
 - If jobs may exceed 15 minutes, increase `--timeout` or consider an async task pattern.
 - Logs are available in Cloud Logging (look for `pipeline`, `classifier`, `bq`, `gcs`, `server`).
 
