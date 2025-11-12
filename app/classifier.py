@@ -71,7 +71,8 @@ def _parse_score(v: object) -> float | None:
         f = 0.0
     if f > 1:
         f = 1.0
-    return f
+    # Normalize to one decimal place (0.0, 0.1, ..., 1.0)
+    return round(f, 1)
 
 
 class GeminiClassifier:
@@ -126,26 +127,34 @@ class GeminiClassifier:
         # Build category ID mapping (C01, C02, ...) to reduce ambiguity and tokens
         self._codes: List[str] = [f"C{idx+1:02d}" for idx in range(len(categories))]
         self._id_to_name: Dict[str, str] = {code: name for code, name in zip(self._codes, categories)}
-        self._name_to_id: Dict[str, str] = {name: code for code, name in self._id_to_name.items()}
 
         cats_lines = "\n".join(f"- {code}: {name}" for code, name in self._id_to_name.items())
-        # System instruction: require IDs only, JSON only, with disambiguation rules
-        self._system_instruction = (
-            "You are a strict product categorizer.\n"
-            "Use ONLY the category IDs from the allowed list (e.g., C01, C02).\n"
-            "Choose the two most relevant categories per item and output JSON ONLY.\n"
-            "Scores must be numeric between 0 and 1.\n\n"
-            "Disambiguation rules:\n"
-            "- Color words (orange, red, green, etc.) are colors by default unless explicit edible context (e.g., 'kg', 'fresh', 'fruit', 'juice', 'menu').\n"
-            "- PPE/cleaning terms (glove, gloves, mask, gown, sanitizer, detergent, mop, etc.) must NOT map to food or beverage categories.\n"
-            "- Meat terms (pork, bacon, beef, chicken, lamb, ham, sausage) map to 'Meat and Poultry', not produce or beverages.\n"
-            "- Seafood terms (fish, shrimp, prawn, squid, crab, salmon, tuna) map to 'Seafood'.\n"
-            "- Alcohol terms (beer, wine, whisky, spirits, liquor) map to alcohol categories, not non-alcoholic beverages.\n"
-            "- Terms implying food (kg, g, ml, litre, pack, fresh, frozen, dried, sliced, smoked, fillet) prefer food categories over equipment/services.\n"
-            "- Items mentioning 'juice' or edible fruits (e.g., 'orange', 'tangerine') MUST map to an appropriate beverage/food category, never hardware or pharmaceuticals.\n"
-            "- Seaweed terms (seaweed, nori, kombu, wakame, kaiso, tosaka) map to 'Seafood' (or the closest edible sea vegetable category).\n\n"
-            f"Allowed categories (ID: Name):\n{cats_lines}\n"
-        )
+        # Build system prompt (compact by default) to reduce tokens
+        compact = (os.getenv("PROMPT_MODE") or "compact").strip().lower() == "compact"
+        if compact:
+            self._system_instruction = (
+                "Classify products into allowed categories by ID only.\n"
+                "Output JSON only. One object per item: {\"i\":<n>,\"c1\":<ID>,\"s1\":<0..1 with one decimal place (0.0..1.0)>,\"j\":<<=20w>}\n"
+                "Rules: edible terms -> food/beverage; PPE/cleaning -> not food; seaweed -> seafood.\n\n"
+                f"Allowed (ID: Name):\n{cats_lines}\n"
+            )
+        else:
+            self._system_instruction = (
+                "You are a strict product categorizer.\n"
+                "Use ONLY the category IDs from the allowed list (e.g., C01, C02).\n"
+                "Choose the most relevant category per item and output JSON ONLY.\n"
+                "Score s1 must be a decimal probability in [0,1] with one decimal place (0.0, 0.1, ..., 1.0).\n\n"
+                "Disambiguation rules:\n"
+                "- Color words (orange, red, green, etc.) are colors by default unless explicit edible context (e.g., 'kg', 'fresh', 'fruit', 'juice', 'menu').\n"
+                "- PPE/cleaning terms (glove, gloves, mask, gown, sanitizer, detergent, mop, etc.) must NOT map to food or beverage categories.\n"
+                "- Meat terms (pork, bacon, beef, chicken, lamb, ham, sausage) map to 'Meat and Poultry', not produce or beverages.\n"
+                "- Seafood terms (fish, shrimp, prawn, squid, crab, salmon, tuna) map to 'Seafood'.\n"
+                "- Alcohol terms (beer, wine, whisky, spirits, liquor) map to alcohol categories, not non-alcoholic beverages.\n"
+                "- Terms implying food (kg, g, ml, litre, pack, fresh, frozen, dried, sliced, smoked, fillet) prefer food categories over equipment/services.\n"
+                "- Items mentioning 'juice' or edible fruits (e.g., 'orange', 'tangerine') MUST map to an appropriate beverage/food category, never hardware or pharmaceuticals.\n"
+                "- Seaweed terms (seaweed, nori, kombu, wakame, kaiso, tosaka) map to 'Seafood' (or the closest edible sea vegetable category).\n\n"
+                f"Allowed categories (ID: Name):\n{cats_lines}\n"
+            )
 
     def classify_batch(
         self,
@@ -160,6 +169,18 @@ class GeminiClassifier:
         total = len(descriptions)
         if total == 0:
             return []
+
+        # Optional prompt-size optimization: truncate long descriptions
+        try:
+            max_len_env = os.getenv("MAX_DESC_CHARS")
+            max_len = int(max_len_env) if max_len_env else 0
+        except Exception:
+            max_len = 0
+        if max_len and max_len > 0:
+            descriptions = [
+                (d if len(d) <= max_len else d[: max_len]) if isinstance(d, str) else ""
+                for d in descriptions
+            ]
 
         # Optional deduplication: classify unique descriptions only
         if deduplicate:
@@ -176,12 +197,18 @@ class GeminiClassifier:
             uniq_descs = descriptions
             norm_order = [_norm(d) for d in descriptions]
 
-        chunks: List[List[str]] = [
-            uniq_descs[i : i + max(1, batch_size)] for i in range(0, len(uniq_descs), max(1, batch_size))
-        ]
+        step = max(1, batch_size)
+        chunks: List[List[str]] = []
+        starts: List[int] = []
+        i = 0
+        while i < len(uniq_descs):
+            ch = uniq_descs[i : i + step]
+            chunks.append(ch)
+            starts.append(i)
+            i += len(ch)
 
         done = 0
-        preds_unique: List[Dict[str, object]] = []
+        preds_unique: List[Dict[str, object] | None] = [None] * len(uniq_descs)
 
         def do_chunk(chunk: List[str]) -> List[Dict[str, object]]:
             return self._classify_chunk(chunk)
@@ -189,44 +216,68 @@ class GeminiClassifier:
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
             future_map = {pool.submit(do_chunk, ch): idx for idx, ch in enumerate(chunks)}
             for fut in as_completed(future_map):
+                idx = future_map[fut]
+                start = starts[idx]
                 res = fut.result()
-                preds_unique.extend(res)
+                preds_unique[start : start + len(res)] = res
                 done += len(res)
                 interval = max(1, progress_every)
                 if done % interval == 0 or done >= len(uniq_descs):
                     log.info(f"Classification progress | done={done}/{len(uniq_descs)} (unique)")
 
         # Map back to original order
-        mapping: Dict[str, Dict[str, object]] = {}
-        for d, p in zip(uniq_descs, preds_unique):
-            mapping[_norm(d)] = p
-        final: List[Dict[str, object]] = [mapping[k] for k in norm_order]
+        if deduplicate:
+            mapping: Dict[str, Dict[str, object]] = {}
+            for d, p in zip(uniq_descs, preds_unique):
+                if p is None:
+                    p = {"c1": None, "s1": None, "j": None}
+                mapping[_norm(d)] = p
+            final: List[Dict[str, object]] = [mapping[k] for k in norm_order]
+        else:
+            # No dedupe: preds_unique already aligned 1:1 with descriptions
+            final = [p if p is not None else {"c1": None, "s1": None, "j": None} for p in preds_unique]
         return final
 
     def _gen_text(self, parts: List[str], want_json: bool = False) -> str:
+        # Basic retry with jitter for transient errors
+        import time, random
+        max_attempts = max(1, int(os.getenv("GENAI_RETRIES", "2") or 2))
+        base_ms = max(50, int(os.getenv("GENAI_RETRY_BASE_MS", "200") or 200))
+        last_text = ""
         try:
-            if self._provider == "vertexai":
-                if want_json:
-                    cfg = GenerationConfig(
-                        response_mime_type="application/json",
-                        temperature=0.0,
-                    )
-                    resp = self._model.generate_content(parts, generation_config=cfg)
-                else:
-                    resp = self._model.generate_content(parts)
-                return (getattr(resp, "text", "") or "").strip()
-            elif self._provider == "googleai":
-                cfg = {"temperature": 0.0}
-                if want_json:
-                    cfg["response_mime_type"] = "application/json"
-                # google-genai: pass list of strings as contents
-                resp = self._ga_client.models.generate_content(
-                    model=self._model_name, contents=parts, config=cfg
-                )
-                return (getattr(resp, "text", "") or "").strip()
+            temp_env = os.getenv("GENAI_TEMPERATURE")
+            temperature = float(temp_env) if temp_env is not None else 0.0
         except Exception:
-            return ""
-        return ""
+            temperature = 0.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if self._provider == "vertexai":
+                    if want_json:
+                        cfg = GenerationConfig(
+                            response_mime_type="application/json",
+                            temperature=temperature,
+                        )
+                        resp = self._model.generate_content(parts, generation_config=cfg)
+                    else:
+                        if temperature and temperature > 0:
+                            cfg = GenerationConfig(temperature=temperature)
+                            resp = self._model.generate_content(parts, generation_config=cfg)
+                        else:
+                            resp = self._model.generate_content(parts)
+                    return (getattr(resp, "text", "") or "").strip()
+                elif self._provider == "googleai":
+                    cfg = {"temperature": temperature}
+                    if want_json:
+                        cfg["response_mime_type"] = "application/json"
+                    resp = self._ga_client.models.generate_content(
+                        model=self._model_name, contents=parts, config=cfg
+                    )
+                    return (getattr(resp, "text", "") or "").strip()
+            except Exception:
+                # Sleep with full jitter
+                if attempt < max_attempts:
+                    time.sleep((base_ms / 1000.0) * (2 ** (attempt - 1)) * random.uniform(0.5, 1.5))
+        return last_text
 
     def _classify_chunk(self, descriptions: List[str]) -> List[Dict[str, object]]:
         if not descriptions:
@@ -235,9 +286,10 @@ class GeminiClassifier:
         items = "\n".join(f"{i+1}. {d}" for i, d in enumerate(descriptions))
         prompt = (
             "You will receive a numbered list of item descriptions.\n"
-            "For each item, choose the two most relevant category IDs (e.g., C01) from the allowed list.\n"
+            "For each item, choose the most relevant category ID (e.g., C01) from the allowed list.\n"
             "Return ONLY a JSON array with one object per item, no extra text.\n"
-            "Each object must be: {\"c1\": <ID>, \"s1\": <0..1>, \"c2\": <ID>, \"s2\": <0..1>}\n\n"
+            "Each object must be: {\"i\": <item number>, \"c1\": <ID>, \"s1\": <0..1 with one decimal place>, \"j\": <short justification in <= 20 words>}\n"
+            "Ensure i matches the numbered list below so results can be mapped back exactly.\n\n"
             f"Items:\n{items}\n\n"
             "Respond with a JSON array of objects as specified."
         )
@@ -245,78 +297,116 @@ class GeminiClassifier:
             text = self._gen_text([self._system_instruction, prompt], want_json=True)
             json_str = _extract_json_array(text)
             arr = json.loads(json_str)
-            if isinstance(arr, list) and len(arr) == len(descriptions):
-                out: List[Dict[str, object]] = []
+            if isinstance(arr, list):
+                # Prefer index-based assembly to guarantee alignment
+                indexed: List[Dict[str, object] | None] = [None] * len(descriptions)
+                all_have_index = True
+                seen = set()
                 for obj in arr:
-                    c1, s1, c2, s2 = self._validate_top2(obj)
-                    out.append({"c1": c1, "s1": s1, "c2": c2, "s2": s2})
-                return out
+                    try:
+                        idx = int(str((obj.get("i") if isinstance(obj, dict) else None) or "0"))
+                    except Exception:
+                        idx = 0
+                    if 1 <= idx <= len(descriptions) and idx not in seen:
+                        c1, s1 = self._validate_top1(obj)
+                        j = self._get_justification(obj)
+                        indexed[idx - 1] = {"c1": c1, "s1": s1, "j": j}
+                        seen.add(idx)
+                    else:
+                        all_have_index = False
+                if all_have_index and all(v is not None for v in indexed):
+                    return [v for v in indexed if v is not None]
+                # Fallback to sequential mapping if indices are missing
+                if len(arr) == len(descriptions):
+                    out: List[Dict[str, object]] = []
+                    for obj in arr:
+                        c1, s1 = self._validate_top1(obj)
+                        j = self._get_justification(obj)
+                        out.append({"c1": c1, "s1": s1, "j": j})
+                    return out
         except Exception:
             pass
         # Retry once with a shorter strict prompt
         try:
             strict = (
                 "Return ONLY a JSON array of objects, one per item. Use category IDs only (e.g., C01). "
-                "Each object: {\"c1\": <ID>, \"s1\": <0..1>, \"c2\": <ID>, \"s2\": <0..1>}"
+                "Each object: {\"i\": <item number>, \"c1\": <ID>, \"s1\": <0..1 with one decimal place>, \"j\": <short justification in <= 20 words>}"
             )
             text = self._gen_text([self._system_instruction, strict, items], want_json=True)
             json_str = _extract_json_array(text)
             arr = json.loads(json_str)
-            if isinstance(arr, list) and len(arr) == len(descriptions):
-                out = []
+            if isinstance(arr, list):
+                indexed: List[Dict[str, object] | None] = [None] * len(descriptions)
+                all_have_index = True
+                seen = set()
                 for obj in arr:
-                    c1, s1, c2, s2 = self._validate_top2(obj)
-                    out.append({"c1": c1, "s1": s1, "c2": c2, "s2": s2})
-                return out
+                    try:
+                        idx = int(str((obj.get("i") if isinstance(obj, dict) else None) or "0"))
+                    except Exception:
+                        idx = 0
+                    if 1 <= idx <= len(descriptions) and idx not in seen:
+                        c1, s1 = self._validate_top1(obj)
+                        j = self._get_justification(obj)
+                        indexed[idx - 1] = {"c1": c1, "s1": s1, "j": j}
+                        seen.add(idx)
+                    else:
+                        all_have_index = False
+                if all_have_index and all(v is not None for v in indexed):
+                    return [v for v in indexed if v is not None]
+                if len(arr) == len(descriptions):
+                    out: List[Dict[str, object]] = []
+                    for obj in arr:
+                        c1, s1 = self._validate_top1(obj)
+                        j = self._get_justification(obj)
+                        out.append({"c1": c1, "s1": s1, "j": j})
+                    return out
         except Exception:
             pass
         # Fallback to single calls for this chunk (no guessing; return nulls if model fails)
         out: List[Dict[str, object]] = []
         for d in descriptions:
-            c1, s1, c2, s2 = self._classify_single_top2(d)
-            out.append({"c1": c1, "s1": s1, "c2": c2, "s2": s2})
+            c1, s1, j = self._classify_single_top1(d)
+            out.append({"c1": c1, "s1": s1, "j": j})
         return out
 
-    def _classify_single_top2(self, description: str) -> Tuple[str | None, float | None, str | None, float | None]:
+    def _classify_single_top1(self, description: str) -> Tuple[str | None, float | None, str | None]:
         prompt = (
             f"Item description: {description}\n"
-            "Choose the two most relevant category IDs from the allowed list (e.g., C01).\n"
-            "Return ONLY JSON object: {\"c1\": <ID>, \"s1\": <0..1>, \"c2\": <ID>, \"s2\": <0..1>}"
+            "Choose the most relevant category ID from the allowed list (e.g., C01).\n"
+            "Return ONLY JSON object: {\"c1\": <ID>, \"s1\": <0..1 with one decimal place>, \"j\": <short justification in <= 20 words>}"
         )
         try:
             text = self._gen_text([self._system_instruction, prompt], want_json=True)
             obj = json.loads(_extract_json_object(text))
-            return self._validate_top2(obj)
+            c1, s1 = self._validate_top1(obj)
+            j = self._get_justification(obj)
+            return c1, s1, j
         except Exception:
             # No guessing: return nulls to indicate missing/invalid model output
-            return None, None, None, None
+            return None, None, None
 
     # Removed unused single-label method to reduce surface area
 
-    def _validate_top2(self, obj: object) -> Tuple[str | None, float | None, str | None, float | None]:
+    def _validate_top1(self, obj: object) -> Tuple[str | None, float | None]:
         if not isinstance(obj, dict):
-            return None, None, None, None
+            return None, None
         c1 = self._resolve_id_or_name(str(obj.get("c1", "")))
-        c2_raw = str(obj.get("c2", ""))
-        c2 = self._resolve_id_or_name(c2_raw)
-        if c1 is None and c2 is None:
-            return None, None, None, None
-        if c2 == c1 and c1 is not None:
-            c2 = self._second_best_different(c1, hint=c2_raw)
         s1 = _parse_score(obj.get("s1"))
-        s2 = _parse_score(obj.get("s2"))
-        return c1, s1, c2, s2
+        return c1, s1
 
-    def _second_best_different(self, first: str, hint: str | None = None) -> str:
-        # Pick best other category different from first using fuzzy match against hint (or first)
-        choices = [k for k in self._choices if self._norm_map[k] != first]
-        if not choices:
-            return first
-        query = _norm(hint or first)
-        match = None
-        if choices:
-            match, _, _ = process.extractOne(query, choices, scorer=fuzz.WRatio)
-        return self._norm_map[match] if match else self._categories[0]
+    def _get_justification(self, obj: object) -> str | None:
+        if isinstance(obj, dict):
+            v = obj.get("j") or obj.get("justification") or obj.get("reason")
+            if isinstance(v, str):
+                t = v.strip()
+            elif v is not None:
+                t = str(v)
+            else:
+                return None
+            return t[:200]
+        return None
+
+    # Removed: second-best helper (no longer used in single-category mode)
 
     def _post_validate_label(self, model_text: str) -> str:
         # Normalize and try exact normalization match

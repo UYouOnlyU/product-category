@@ -63,6 +63,11 @@ def run(
     month: str = Query(..., description="Month to query, format YYYYMM (legacy MM-YYYY also accepted)"),
     limit: int | None = Query(None, ge=1, description="Optional limit of rows"),
     dry_run: bool = Query(False, alias="dry-run", description="Do not upload to GCS"),
+    org_id_raw: str | None = Query(
+        None,
+        alias="org_ID",
+        description="Comma-separated org_ID list, e.g. 10001,10002 (defaults to ALL)",
+    ),
     # Optional performance knobs (also via query)
     progress_every: int | None = Query(
         None, ge=1, description="How often to log progress counts"
@@ -100,6 +105,11 @@ def run(
             progress_every if progress_every is not None else (cfg.classify_progress_every or 1)
         )
 
+        # Parse org_IDs if provided
+        org_ids = None
+        if org_id_raw:
+            org_ids = [s for s in (x.strip() for x in org_id_raw.split(",")) if s]
+
         log.info(
             "API run | month=%s | limit=%s | dry_run=%s | batch_size=%s | concurrency=%s | progress_every=%s | dedupe=%s",
             month,
@@ -119,6 +129,7 @@ def run(
             batch_size=max(1, eff_batch_size),
             concurrency=max(1, eff_concurrency),
             deduplicate=deduplicate,
+            org_ids=org_ids,
         )
         return result
     except ValueError as e:

@@ -12,9 +12,10 @@ from typing import List, Dict, Any
 from google.cloud import bigquery
 
 from .config import Config
-from .bq import query_invoices_by_month
+from .bq import query_invoices_by_month, iter_invoices_by_month
 from .classifier import GeminiClassifier
 from .storage import upload_to_gcs
+from .cache import load_cache_from_gcs, save_cache_to_gcs
 
 
 # Accept YYYYMM as primary; allow legacy MM-YYYY for backward compatibility
@@ -49,6 +50,7 @@ def run_pipeline(
     batch_size: int = 8,
     concurrency: int = 4,
     deduplicate: bool = True,
+    org_ids: list[str] | None = None,
 ) -> Dict[str, Any]:
     log = logging.getLogger("pipeline")
     log.info(f"Starting pipeline | month={month} | limit={limit} | dry_run={dry_run}")
@@ -64,17 +66,12 @@ def run_pipeline(
             raise ValueError("allowed_categories.json must not be empty")
     log.info(f"Loaded allowed categories | count={len(categories)}")
 
-    # BigQuery client
+    # BigQuery client and iterator
     bq_client = bigquery.Client(project=cfg.gcp_project_id)
-    log.info(f"Querying BigQuery | table={cfg.table_id} | month={month_yyyymm} | limit={limit}")
-    rows = query_invoices_by_month(bq_client, cfg.table_id, month_yyyymm, limit)
-    log.info(f"BigQuery returned rows | rows={len(rows)}")
-
-    # Prepare descriptions for classification
-    descriptions: List[str] = []
-    for r in rows:
-        val = str(r.get("item_description") or "").strip()
-        descriptions.append(val)
+    log.info(
+        f"Querying BigQuery | table={cfg.table_id} | month={month_yyyymm} | limit={limit} | org_ids={org_ids if org_ids else 'ALL'}"
+    )
+    row_iter = iter_invoices_by_month(bq_client, cfg.table_id, month_yyyymm, org_ids, limit)
 
     # Classify
     log.info(f"Initializing Gemini classifier | model={cfg.gemini_model} | location={cfg.gcp_location}")
@@ -85,88 +82,82 @@ def run_pipeline(
         categories=categories,
     )
 
-    log.info(
-        f"Classifying descriptions | count={len(descriptions)} | batch_size={batch_size} | concurrency={concurrency} | dedupe={deduplicate}"
-    )
-    predictions = classifier.classify_batch(
-        descriptions,
-        progress_every=progress_every,
-        batch_size=batch_size,
-        concurrency=concurrency,
-        deduplicate=deduplicate,
-    )
-    log.info("Classification finished")
+    # Optional cross-run cache
+    cache_bucket = os.getenv("CACHE_GCS_BUCKET")
+    cache_blob = os.getenv("CACHE_GCS_BLOB")
+    cache: Dict[str, tuple[str | None, float | None, str | None]] = {}
+    if cache_bucket and cache_blob:
+        try:
+            cache = load_cache_from_gcs(cache_bucket, cache_blob)
+            log.info(f"Loaded cache | entries={len(cache)} from gs://{cache_bucket}/{cache_blob}")
+        except Exception:
+            log.warning("Cache load failed; proceeding without cache")
 
-    # Merge predictions back to records (no heuristic override; model-only values)
-    enriched: List[Dict[str, Any]] = []
-    missing_score_count = 0
-    missing_any_count = 0
-    for r, pred in zip(rows, predictions):
-        rr = dict(r)
-        # add product_description from item_description
-        product_desc = str(r.get("item_description") or "").strip()
-        rr["product_description"] = product_desc
-        # take model output directly; if model failed, values may be None
-        c1 = pred.get("c1")
-        s1 = pred.get("s1")
-        c2 = pred.get("c2")
-        s2 = pred.get("s2")
-        if s1 is None or s2 is None:
-            missing_score_count += 1
-        if c1 is None or c2 is None or s1 is None or s2 is None:
-            missing_any_count += 1
-        rr["predicted_category"] = c1
-        rr["relevance_score"] = s1
-        rr["second_category"] = c2
-        rr["second_relevance_score"] = s2
-        enriched.append(rr)
-
-    log.info(
-        f"Missing counters | missing_scores={missing_score_count} | missing_any_field={missing_any_count}"
-    )
-
-    # Write CSV locally
+    # Streaming: classify and write CSV chunk-by-chunk
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     file_name = f"product-category_{month}_{ts}.csv"
     out_dir = Path(os.getenv("OUTPUT_DIR", "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
     local_path = out_dir / file_name
 
-    if enriched:
-        # Ensure product_description is placed before the prediction columns
-        pred_cols = [
-            "predicted_category",
-            "relevance_score",
-            "second_category",
-            "second_relevance_score",
-        ]
-        base_fields = [k for k in enriched[0].keys() if k not in pred_cols]
-        if "product_description" in base_fields:
-            base_fields = [k for k in base_fields if k != "product_description"] + [
-                "product_description"
-            ]
-        fieldnames = base_fields + pred_cols
-    else:
-        fieldnames = [
-            "product_description",
-            "predicted_category",
-            "relevance_score",
-            "second_category",
-            "second_relevance_score",
-        ]
+    row_chunk_size = int(os.getenv("ROW_CHUNK_SIZE", "500") or 500)
+    min_desc = int(os.getenv("MIN_DESC_CHARS", "2") or 2)
+    pred_cols = ["predict category", "score", "short justification"]
+    log.info(f"Streaming CSV | path={str(local_path)} | row_chunk_size={row_chunk_size}")
+    total_rows = 0
+    missing_score_count = 0
+    missing_any_count = 0
+    written = 0
 
-    log.info(f"Writing CSV | path={str(local_path)}")
     with open(local_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        total = len(enriched)
-        if total == 0:
-            pass
-        for idx, row in enumerate(enriched, start=1):
-            writer.writerow(row)
-            if idx % max(1, progress_every) == 0 or idx == total:
-                log.info(f"CSV progress | written={idx}/{total}")
-    log.info(f"CSV written | rows={len(enriched)}")
+        writer = None
+        chunk: List[Dict[str, Any]] = []
+        for row in row_iter:
+            chunk.append(row)
+            if len(chunk) >= row_chunk_size:
+                written += _process_chunk(
+                    classifier,
+                    chunk,
+                    writer_ref := [writer],
+                    f,
+                    pred_cols,
+                    progress_every,
+                    batch_size,
+                    concurrency,
+                    deduplicate,
+                    min_desc,
+                    cache,
+                    log,
+                )
+                writer = writer_ref[0]
+                total_rows += len(chunk)
+                chunk = []
+        if chunk:
+            written += _process_chunk(
+                classifier,
+                chunk,
+                writer_ref := [writer],
+                f,
+                pred_cols,
+                progress_every,
+                batch_size,
+                concurrency,
+                deduplicate,
+                min_desc,
+                cache,
+                log,
+            )
+            writer = writer_ref[0]
+            total_rows += len(chunk)
+        log.info(f"CSV written | rows={written}")
+
+    # Save cache back if enabled
+    if cache_bucket and cache_blob:
+        try:
+            save_cache_to_gcs(cache_bucket, cache_blob, cache)
+            log.info(f"Saved cache | entries={len(cache)} to gs://{cache_bucket}/{cache_blob}")
+        except Exception:
+            log.warning("Cache save failed; continuing")
 
     # Upload to GCS unless dry_run
     gcs_uri = None
@@ -179,8 +170,87 @@ def run_pipeline(
 
     return {
         "month": month,
-        "total_rows": len(rows),
-        "processed": len(enriched),
+        "total_rows": written,
+        "processed": written,
         "local_csv": str(local_path),
         "gcs_uri": gcs_uri,
     }
+
+
+def _process_chunk(
+    classifier: GeminiClassifier,
+    rows: List[Dict[str, Any]],
+    writer_ref: List[csv.DictWriter | None],
+    f,
+    pred_cols: List[str],
+    progress_every: int,
+    batch_size: int,
+    concurrency: int,
+    deduplicate: bool,
+    min_desc: int,
+    cache: Dict[str, tuple[str | None, float | None, str | None]],
+    log: logging.Logger,
+) -> int:
+    # Prepare descriptions with guard
+    descs: List[str] = []
+    empties: List[int] = []
+    for i, r in enumerate(rows):
+        d = str(r.get("item_description") or "").strip()
+        if len(d) < min_desc:
+            empties.append(i)
+            descs.append("")
+        else:
+            descs.append(d)
+
+    # Use cache to short-circuit
+    to_classify_idx: List[int] = []
+    preds: List[Dict[str, Any] | None] = [None] * len(rows)
+    for i, d in enumerate(descs):
+        if i in empties:
+            preds[i] = {"c1": None, "s1": None, "j": "missing/too short description"}
+        else:
+            k = _norm_local(d)
+            if cache and k in cache:
+                c1, s1, j = cache[k]
+                preds[i] = {"c1": c1, "s1": s1, "j": j}
+            else:
+                to_classify_idx.append(i)
+
+    if to_classify_idx:
+        texts = [descs[i] for i in to_classify_idx]
+        cls = classifier.classify_batch(
+            texts,
+            progress_every=progress_every,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            deduplicate=deduplicate,
+        )
+        for i, pr in zip(to_classify_idx, cls):
+            preds[i] = pr
+            k = _norm_local(descs[i])
+            cache[k] = (pr.get("c1"), pr.get("s1"), pr.get("j"))
+
+    # Write out
+    writer = writer_ref[0]
+    written = 0
+    for i, r in enumerate(rows):
+        pr = preds[i] or {"c1": None, "s1": None, "j": None}
+        rr = dict(r)
+        rr["predict category"] = pr.get("c1")
+        rr["score"] = pr.get("s1")
+        rr["short justification"] = pr.get("j")
+        if writer is None:
+            base_fields = [k for k in rr.keys() if k not in pred_cols]
+            fieldnames = base_fields + pred_cols
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer_ref[0] = writer
+        writer.writerow(rr)
+        written += 1
+        if written % max(1, progress_every) == 0 or i == len(rows) - 1:
+            log.info(f"CSV progress | chunk_written={written}/{len(rows)}")
+    return written
+
+
+def _norm_local(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).casefold()
