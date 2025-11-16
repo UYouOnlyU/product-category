@@ -135,7 +135,10 @@ class GeminiClassifier:
             self._system_instruction = (
                 "Classify products into allowed categories by ID only.\n"
                 "Output JSON only. One object per item: {\"i\":<n>,\"c1\":<ID>,\"s1\":<0..1 with one decimal place (0.0..1.0)>,\"j\":<<=20w>}\n"
-                "Rules: edible terms -> food/beverage; PPE/cleaning -> not food; seaweed -> seafood.\n\n"
+                "Rules: edible terms -> food/beverage; PPE/cleaning -> not food; seaweed -> seafood.\n"
+                "If description has 'Name : details', use the product name before ':' as the primary signal (e.g., 'Coffee Bean : Breakfast Blend' -> use 'Coffee Bean').\n"
+                "Quick examples (target categories): condensed/sweetened milk -> Dairy and Eggs; soy milk -> Dairy and Eggs; lemon/paprika/peppercorn powders -> Fruit and Vegetables; tomato/fish sauce -> Food Preparation Ingredients; tortillas/wraps -> Bakery; tea or drink syrups -> Nonalcoholic Beverages.\n"
+                "More examples: mounted stone (shank cone) -> Plants and Flowers; projector screen -> Computers and Communications; furikake (seaweed/bonito flakes) -> Prepared Food and Ingredients; pickled vegetable mix (fukujinzuke) -> Fruit and Vegetables; sports/athletic gloves -> Sport and Recreation.\n\n"
                 f"Allowed (ID: Name):\n{cats_lines}\n"
             )
         else:
@@ -145,6 +148,9 @@ class GeminiClassifier:
                 "Choose the most relevant category per item and output JSON ONLY.\n"
                 "Score s1 must be a decimal probability in [0,1] with one decimal place (0.0, 0.1, ..., 1.0).\n\n"
                 "Disambiguation rules:\n"
+                "- If a description is 'Name : details', use the product name before ':' as the main cue; trailing details may refine but must not override the base product (e.g., 'Coffee Bean : Breakfast Blend' -> treat as Coffee Bean).\n"
+                "- Quick examples: condensed/sweetened/evap milk or milk powder -> Dairy and Eggs; soy milk -> Dairy and Eggs; lemon/paprika/peppercorn powders -> Fruit and Vegetables; tomato/fish/soy/BBQ sauces -> Food Preparation Ingredients (not seafood/meals); tortillas/wraps/flatbreads -> Bakery; tea/coffee and drink syrups -> Nonalcoholic Beverages.\n"
+                "- More examples: mounted stone (shank/cone) -> Plants and Flowers; projector screen -> Computers and Communications; furikake (seaweed + bonito flakes) -> Prepared Food and Ingredients; pickled vegetable mix (fukujinzuke) -> Fruit and Vegetables; sports/athletic gloves -> Sport and Recreation.\n"
                 "- Color words (orange, red, green, etc.) are colors by default unless explicit edible context (e.g., 'kg', 'fresh', 'fruit', 'juice', 'menu').\n"
                 "- PPE/cleaning terms (glove, gloves, mask, gown, sanitizer, detergent, mop, etc.) must NOT map to food or beverage categories.\n"
                 "- Meat terms (pork, bacon, beef, chicken, lamb, ham, sausage) map to 'Meat and Poultry', not produce or beverages.\n"
@@ -287,6 +293,7 @@ class GeminiClassifier:
         prompt = (
             "You will receive a numbered list of item descriptions.\n"
             "For each item, choose the most relevant category ID (e.g., C01) from the allowed list.\n"
+            "If an item looks like 'Name : details', use the product name before ':' as the primary cue; details may refine but not override.\n"
             "Return ONLY a JSON array with one object per item, no extra text.\n"
             "Each object must be: {\"i\": <item number>, \"c1\": <ID>, \"s1\": <0..1 with one decimal place>, \"j\": <short justification in <= 20 words>}\n"
             "Ensure i matches the numbered list below so results can be mapped back exactly.\n\n"

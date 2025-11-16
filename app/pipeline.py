@@ -71,7 +71,15 @@ def run_pipeline(
     log.info(
         f"Querying BigQuery | table={cfg.table_id} | month={month_yyyymm} | limit={limit} | org_ids={org_ids if org_ids else 'ALL'}"
     )
-    row_iter = iter_invoices_by_month(bq_client, cfg.table_id, month_yyyymm, org_ids, limit)
+    row_iter = iter_invoices_by_month(
+        bq_client,
+        cfg.table_id,
+        month_yyyymm,
+        org_ids=org_ids,
+        limit=limit,
+        invoice_date_field=cfg.invoice_date_field,
+        org_field=cfg.org_field,
+    )
 
     # Classify
     log.info(f"Initializing Gemini classifier | model={cfg.gemini_model} | location={cfg.gcp_location}")
@@ -127,6 +135,7 @@ def run_pipeline(
                     deduplicate,
                     min_desc,
                     cache,
+                    cfg.item_description_field,
                     log,
                 )
                 writer = writer_ref[0]
@@ -145,6 +154,7 @@ def run_pipeline(
                 deduplicate,
                 min_desc,
                 cache,
+                cfg.item_description_field,
                 log,
             )
             writer = writer_ref[0]
@@ -189,13 +199,14 @@ def _process_chunk(
     deduplicate: bool,
     min_desc: int,
     cache: Dict[str, tuple[str | None, float | None, str | None]],
+    item_field: str,
     log: logging.Logger,
 ) -> int:
     # Prepare descriptions with guard
     descs: List[str] = []
     empties: List[int] = []
     for i, r in enumerate(rows):
-        d = str(r.get("item_description") or "").strip()
+        d = str(r.get(item_field) or "").strip()
         if len(d) < min_desc:
             empties.append(i)
             descs.append("")

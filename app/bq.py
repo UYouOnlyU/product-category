@@ -8,6 +8,9 @@ def query_invoices_by_month(
     bq_client: bigquery.Client,
     table_id: str,
     month_str: str,
+    *,
+    invoice_date_field: str = "check_invoice_date",
+    org_field: str = "check_organization",
     org_ids: List[str] | None = None,
     limit: int | None = None,
 ) -> List[Dict[str, Any]]:
@@ -26,8 +29,8 @@ def query_invoices_by_month(
     # We treat dates as the first day of the month and filter by requested month bounds (MM-YYYY).
     filter_org = ""
     if org_ids:
-        # Table column is STRING: check_organization
-        filter_org = "\n      AND s.check_organization IN UNNEST(@org_ids)"
+        # Table column is STRING
+        filter_org = f"\n      AND s.{org_field} IN UNNEST(@org_ids)"
 
     query = f"""
     WITH src AS (
@@ -35,11 +38,11 @@ def query_invoices_by_month(
         *,
         COALESCE(
           -- Primary: YYYYMM as string or int
-          SAFE.PARSE_DATE('%Y%m%d', CONCAT(CAST(check_invoice_date AS STRING), '01')),
+          SAFE.PARSE_DATE('%Y%m%d', CONCAT(CAST({invoice_date_field} AS STRING), '01')),
           -- Legacy: MM-YYYY or MM/YYYY
-          SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01')),
+          SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(CAST({invoice_date_field} AS STRING), '/', '-'), '-01')),
           -- Fallback: YYYY-MM or YYYY/MM
-          SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01'))
+          SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REPLACE(CAST({invoice_date_field} AS STRING), '/', '-'), '-01'))
         ) AS parsed_month_start
       FROM `{table_id}`
     ), bounds AS (
@@ -79,6 +82,9 @@ def iter_invoices_by_month(
     bq_client: bigquery.Client,
     table_id: str,
     month_str: str,
+    *,
+    invoice_date_field: str = "check_invoice_date",
+    org_field: str = "check_organization",
     org_ids: List[str] | None = None,
     limit: int | None = None,
     page_size: int | None = None,
@@ -90,16 +96,16 @@ def iter_invoices_by_month(
     """
     filter_org = ""
     if org_ids:
-        filter_org = "\n      AND s.check_organization IN UNNEST(@org_ids)"
+        filter_org = f"\n      AND s.{org_field} IN UNNEST(@org_ids)"
 
     query = f"""
     WITH src AS (
       SELECT
         *,
         COALESCE(
-          SAFE.PARSE_DATE('%Y%m%d', CONCAT(CAST(check_invoice_date AS STRING), '01')),
-          SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01')),
-          SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REPLACE(CAST(check_invoice_date AS STRING), '/', '-'), '-01'))
+          SAFE.PARSE_DATE('%Y%m%d', CONCAT(CAST({invoice_date_field} AS STRING), '01')),
+          SAFE.PARSE_DATE('%m-%Y-%d', CONCAT(REPLACE(CAST({invoice_date_field} AS STRING), '/', '-'), '-01')),
+          SAFE.PARSE_DATE('%Y-%m-%d', CONCAT(REPLACE(CAST({invoice_date_field} AS STRING), '/', '-'), '-01'))
         ) AS parsed_month_start
       FROM `{table_id}`
     ), bounds AS (

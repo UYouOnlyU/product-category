@@ -24,6 +24,9 @@ class Config:
     classify_batch_size: Optional[int]
     classify_concurrency: Optional[int]
     classify_progress_every: Optional[int]
+    invoice_date_field: str
+    org_field: str
+    item_description_field: str
 
 
 def load_config() -> Config:
@@ -45,6 +48,9 @@ def load_config() -> Config:
         classify_batch_size=_get_int("CLASSIFY_BATCH_SIZE"),
         classify_concurrency=_get_int("CLASSIFY_CONCURRENCY"),
         classify_progress_every=_get_int("CLASSIFY_PROGRESS_EVERY"),
+        invoice_date_field=_get_str("INVOICE_DATE_FIELD", "check_invoice_date"),
+        org_field=_get_str("ORG_FIELD", "check_organization"),
+        item_description_field=_get_str("ITEM_DESCRIPTION_FIELD", "item_description"),
     )
     return cfg
 
@@ -64,3 +70,8 @@ def _get_int(key: str) -> Optional[int]:
         return int(val)
     except ValueError:
         raise RuntimeError(f"Environment variable {key} must be an integer if set")
+
+
+def _get_str(key: str, default: str) -> str:
+    val = os.getenv(key)
+    return val if val is not None and val != "" else default
